@@ -1274,6 +1274,7 @@
   "ssh.status.disconnected": "Disconnected",
   "ssh.status.error": "Error",
   "ssh.title": "Remote (SSH)",
+  "ssh.workspaceSubtitle": "SSH · {{host}}",
   "status.backlog": "Várakozó",
   "status.cancelled": "Megszakítva",
   "status.done": "Kész",
