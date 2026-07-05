@@ -100,6 +100,14 @@ export interface WsRpcClientOptions {
   mode?: TransportMode
   /** Accept self-signed TLS certificates for wss:// connections. Default: false. Only works in Node.js (main process). */
   tlsRejectUnauthorized?: boolean
+  /**
+   * Optional async hook invoked before EVERY connect/reconnect to (re)resolve
+   * the live target. Used for SSH-backed workspaces whose forwarded localhost
+   * port is ephemeral: a reconnect must re-establish the tunnel and dial the NEW
+   * port, not the dead one. Returning a new `url`/`token` updates the socket
+   * target for that attempt. Omit for plain connections (no behavior change).
+   */
+  resolveTarget?: () => Promise<{ url: string; token?: string }>
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +137,12 @@ export class WsRpcClient implements RpcClient {
   /** Set when server sends shuttingDown — prevents reconnection attempts. */
   private permanentlyClosed = false
   private connectStarted = false
+  /**
+   * Monotonic connect generation. Each connect() bumps it; async work started
+   * by an older connect (e.g. a slow resolveTarget) bails when it settles late,
+   * so it can never clobber the url/token of — or tear down — a newer attempt.
+   */
+  private connectEpoch = 0
   private connectError: Error | null = null
   private readyPromise: Promise<void> | null = null
   private resolveReady: (() => void) | null = null
@@ -136,10 +150,13 @@ export class WsRpcClient implements RpcClient {
   private connectionState: TransportConnectionState
   private serverChannels: Set<string> | null = null
 
-  private readonly url: string
+  // Mutable so an SSH-backed reconnect can re-target a fresh forwarded port/token
+  // via `resolveTarget`. Plain connections never reassign these.
+  private url: string
   private readonly workspaceId: string | undefined
   private readonly webContentsId: number | undefined
-  private readonly token: string | undefined
+  private token: string | undefined
+  private readonly resolveTarget?: () => Promise<{ url: string; token?: string }>
   private readonly clientCapabilities: string[]
   private readonly requestTimeout: number
   private readonly maxReconnectDelay: number
@@ -160,6 +177,7 @@ export class WsRpcClient implements RpcClient {
     this.connectTimeout = opts?.connectTimeout ?? 10_000
     this.mode = opts?.mode ?? this.inferMode(url)
     this.tlsRejectUnauthorized = opts?.tlsRejectUnauthorized ?? true
+    this.resolveTarget = opts?.resolveTarget
 
     this.connectionState = {
       mode: this.mode,
@@ -348,14 +366,69 @@ export class WsRpcClient implements RpcClient {
   connect(): void {
     if (this.destroyed) return
 
+    const epoch = ++this.connectEpoch
     this.connectStarted = true
     this.connectError = null
     this.createReadyPromise()
 
-    const isReconnectAttempt = this.reconnectAttempt > 0 || this.pendingReconnect !== null
-    const status: TransportConnectionStatus = isReconnectAttempt ? 'reconnecting' : 'connecting'
+    // SSH-backed clients re-resolve the live target (fresh forwarded port + token)
+    // before every attempt. On failure, surface it as a connection error and let
+    // the normal reconnect loop retry (which re-resolves again).
+    if (this.resolveTarget) {
+      this.setConnectionState({
+        status: this.computeConnectingStatus(),
+        attempt: this.reconnectAttempt,
+        nextRetryInMs: undefined,
+        lastError: undefined,
+      })
+      // connectTimeout only guards the socket handshake, so bound the resolve
+      // phase separately. 3x connectTimeout because resolution can legitimately
+      // include re-establishing an SSH tunnel + server bootstrap.
+      const resolveTimeoutMs = this.connectTimeout * 3
+      let resolveTimer: ReturnType<typeof setTimeout> | null = null
+      const resolveTimeout = new Promise<never>((_, reject) => {
+        resolveTimer = setTimeout(() => {
+          reject(this.createConnectionError('timeout', `resolveTarget timed out after ${resolveTimeoutMs}ms`, 'RESOLVE_TARGET_TIMEOUT'))
+        }, resolveTimeoutMs)
+      })
+      void Promise.race([this.resolveTarget(), resolveTimeout])
+        .then((target) => {
+          if (this.destroyed || epoch !== this.connectEpoch) return // stale attempt — ignore
+          this.url = target.url
+          if (target.token !== undefined) this.token = target.token
+          this.connectionState = { ...this.connectionState, url: target.url }
+          this.openSocket()
+        })
+        .catch((err) => {
+          if (this.destroyed || epoch !== this.connectEpoch) return // stale attempt — ignore
+          const e = (err as any)?.kind
+            ? (err as Error)
+            : this.createConnectionError('network', err instanceof Error ? err.message : String(err), 'RESOLVE_TARGET_FAILED')
+          this.connectError = e
+          this.setConnectionState({ status: 'failed', lastError: this.toErrorState(e), attempt: this.reconnectAttempt })
+          this.failReady(e)
+          if (this.autoReconnect && !this.permanentlyClosed) this.scheduleReconnect()
+        })
+        .finally(() => {
+          if (resolveTimer) clearTimeout(resolveTimer)
+        })
+      return
+    }
+
+    this.openSocket()
+  }
+
+  /** Status for a new connection attempt — shared by the resolve phase and openSocket(). */
+  private computeConnectingStatus(): TransportConnectionStatus {
+    return this.reconnectAttempt > 0 || this.pendingReconnect !== null ? 'reconnecting' : 'connecting'
+  }
+
+  /** Open the WebSocket against the current (already-resolved) url/token. */
+  private openSocket(): void {
+    if (this.destroyed) return
+
     this.setConnectionState({
-      status,
+      status: this.computeConnectingStatus(),
       attempt: this.reconnectAttempt,
       nextRetryInMs: undefined,
       lastError: undefined,
@@ -450,6 +523,7 @@ export class WsRpcClient implements RpcClient {
 
   destroy(): void {
     this.destroyed = true
+    this.connectEpoch++ // invalidate any in-flight resolveTarget
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
@@ -622,6 +696,7 @@ export class WsRpcClient implements RpcClient {
           // Server is shutting down — stop reconnection before dispatching
           if (envelope.channel === 'server:shuttingDown') {
             this.permanentlyClosed = true
+            this.connectEpoch++ // invalidate any in-flight resolveTarget
             this.setConnectionState({
               status: 'disconnected',
               lastError: { kind: 'server', message: 'Server is shutting down', code: 'SERVER_SHUTDOWN' },

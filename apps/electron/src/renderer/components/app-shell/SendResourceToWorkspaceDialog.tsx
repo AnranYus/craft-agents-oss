@@ -25,6 +25,7 @@ import { Button } from '@/components/ui/button'
 import { CrossfadeAvatar } from '@/components/ui/avatar'
 import { useWorkspaceIcons } from '@/hooks/useWorkspaceIcon'
 import { cn } from '@/lib/utils'
+import { isSshBackedWorkspace } from '../../../shared/ssh'
 import type { Workspace, ExportResourcesOptions, ResourceImportMode } from '../../../shared/types'
 
 export type SendResourceType = 'source' | 'skill' | 'automation'
@@ -96,6 +97,13 @@ export function SendResourceToWorkspaceDialog({
 
     // Fire parallel checks
     for (const ws of remoteTargets) {
+      // SSH-backed workspaces: the persisted url is an ephemeral (stale) port —
+      // the transfer path resolves a fresh tunnel at send time, so report ok
+      // instead of probing a dead port.
+      if (isSshBackedWorkspace(ws)) {
+        setRemoteHealthMap(prev => new Map(prev).set(ws.id, 'ok'))
+        continue
+      }
       window.electronAPI.testRemoteConnection(ws.remoteServer!.url, ws.remoteServer!.token)
         .then(result => {
           if (abort.signal.aborted) return
