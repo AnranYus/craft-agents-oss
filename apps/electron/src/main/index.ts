@@ -800,9 +800,8 @@ app.whenReady().then(async () => {
         if (!targetWorkspace?.remoteServer) throw new Error(`Workspace ${targetWorkspaceId} has no remote server`)
         if (!sessionManager) throw new Error('Session manager not initialized')
 
-        // SSH-backed configs persist an ephemeral (stale) forwarded port — resolve
-        // a live { url, token } through the tunnel/bootstrap machinery before
-        // dialing. Plain-ws configs pass through unchanged.
+        // SSH-backed configs persist a stale forwarded port — resolve a live
+        // { url, token } through the tunnel/bootstrap machinery before dialing.
         const { resolveRemoteConnection } = await import('./ssh-tunnel/connection-resolver')
         const { getSshTunnelManager } = await import('./ssh-tunnel/ssh-tunnel-manager')
         const resolverDeps = getSshTunnelManager().connectionResolverDeps()
