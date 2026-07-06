@@ -1,9 +1,9 @@
 name: Build Release Installers
 
-# A merge into `main` (i.e. a merged PR, under branch protection) builds the
-# desktop installers for macOS (Apple Silicon), Windows (x64) and Linux (x64),
-# uploads each as a run artifact, and publishes a GitHub prerelease with all three.
-# Also runnable on demand via the Actions tab.
+# A merge into `main` (or manual dispatch) builds the desktop installers
+# (macOS Apple Silicon, Windows x64, Linux x64) AND the prebuilt remote-server
+# tarballs (linux/darwin x64/arm64 — downloaded by one-click SSH), then publishes
+# them to a version-addressable GitHub release (tag v<version>).
 on:
   push:
     branches: [main]
@@ -92,9 +92,63 @@ jobs:
           path: ${{ matrix.files }}
           if-no-files-found: error
 
+  # Prebuilt remote-server tarballs the one-click SSH flow downloads onto the
+  # target host. build-server.ts copies the native SDK binary from local
+  # node_modules and skips it cross-arch, so each target builds on its own arch.
+  build-server:
+    name: Server ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: macos-13
+            target: darwin-x64
+          - os: macos-14
+            target: darwin-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build bundled subprocess artifacts
+        shell: bash
+        run: |
+          bun run build:wa-worker
+          bun run server:build:subprocess
+
+      - name: Build server tarball (${{ matrix.target }})
+        run: bun run server:build:${{ matrix.target }}
+
+      - name: Upload server tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: craft-server-${{ matrix.target }}
+          path: dist/craft-server-*-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
   release:
-    name: Publish prerelease
-    needs: build
+    name: Publish release
+    needs: [build, build-server]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -116,19 +170,23 @@ jobs:
         id: ver
         run: echo "version=$(node -p "require('./apps/electron/package.json').version")" >> "$GITHUB_OUTPUT"
 
-      - name: Publish GitHub prerelease
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.ver.outputs.version }}-build.${{ github.run_number }}
-          name: Craft Agents v${{ steps.ver.outputs.version }} (build ${{ github.run_number }})
+          # Version-addressable so one-click SSH can build the download URL from
+          # the app version: .../releases/download/v<version>/craft-server-...tar.gz
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: Craft Agents v${{ steps.ver.outputs.version }}
           prerelease: true
           body: |
             Automated build from ${{ github.sha }}.
 
-            Installers are **unsigned** unless signing secrets are configured — macOS
-            Gatekeeper and Windows SmartScreen will warn on first launch.
+            Desktop installers are **unsigned** unless signing secrets are configured —
+            macOS Gatekeeper and Windows SmartScreen will warn on first launch. The
+            `craft-server-*.tar.gz` assets are the prebuilt remote server that one-click
+            SSH downloads onto the target host (per architecture).
 
-            | Platform | File |
+            | Platform | Installer |
             | --- | --- |
             | macOS (Apple Silicon) | `Craft-Agents-arm64.dmg` |
             | Windows (x64) | `Craft-Agents-x64.exe` |
@@ -137,4 +195,5 @@ jobs:
             installers/**/*.dmg
             installers/**/*.exe
             installers/**/*.AppImage
+            installers/**/*.tar.gz
           fail_on_unmatched_files: true

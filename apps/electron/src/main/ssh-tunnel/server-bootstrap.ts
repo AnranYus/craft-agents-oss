@@ -1,11 +1,10 @@
 import type { SshHostConfig } from '@craft-agent/shared/config'
-import type { RemoteTarget, ResolvedArtifact } from './server-artifact.ts'
+import type { RemoteTarget } from './server-artifact.ts'
 
 export type BootstrapPhase =
   | 'checking-server'
   | 'detecting-os'
-  | 'building-server'
-  | 'uploading-server'
+  | 'downloading-server'
   | 'installing-server'
   | 'starting-server'
   | 'waiting-for-server'
@@ -42,12 +41,10 @@ export interface RunRemoteOptions {
 export interface ServerBootstrapDeps {
   /** Run a command over ssh on the remote host; resolves stdout. */
   runRemote: (host: SshHostConfig, command: string, opts?: RunRemoteOptions) => Promise<string>
-  /** Upload a local file to a remote absolute-ish path via scp. */
-  uploadFile: (host: SshHostConfig, localPath: string, remotePath: string) => Promise<void>
   /** Detect remote target from `uname -sm`. */
   detectTarget: (unameOutput: string) => RemoteTarget
-  /** Ensure a server artifact for the target exists locally; returns its path. */
-  resolveArtifact: (target: RemoteTarget) => Promise<ResolvedArtifact>
+  /** Direct download URL of the prebuilt server archive for a target. */
+  resolveDownloadUrl: (target: RemoteTarget) => string
   /** Probe the (already forwarded) local port for a live server. */
   probe: () => Promise<boolean>
   /** Generate a fresh server auth token. */
@@ -104,14 +101,28 @@ function detach(launch: string): string {
   return `sh -c ${posixSingleQuote(launch)} > /dev/null 2>&1 < /dev/null`
 }
 
-export function buildStartCommand(archiveRemotePath: string, remotePort: number): string {
-  // Extract into the install dir, then start start.sh detached, logging to server.log.
+/** Temp path on the remote for the downloaded archive. */
+export const REMOTE_DOWNLOAD_TMP = '~/.craft-agent/craft-server-download.tar.gz'
+
+/** Remote command that downloads the prebuilt archive with curl (wget fallback),
+ * both following redirects (GitHub release -> CDN). */
+export function buildDownloadCommand(url: string): string {
+  const q = posixSingleQuote(url)
+  return (
+    `mkdir -p ${REMOTE_INSTALL_DIR} && ` +
+    `if command -v curl >/dev/null 2>&1; then curl -fL --retry 3 --connect-timeout 20 -o ${REMOTE_DOWNLOAD_TMP} ${q}; ` +
+    `elif command -v wget >/dev/null 2>&1; then wget -q -O ${REMOTE_DOWNLOAD_TMP} ${q}; ` +
+    `else echo 'neither curl nor wget is available on the remote host' >&2; exit 1; fi`
+  )
+}
+
+/** Remote command that extracts the downloaded archive into the install dir and
+ * removes the temp download. */
+export function buildExtractCommand(): string {
   return [
-    `mkdir -p ${REMOTE_INSTALL_DIR}`,
-    `tar -xzf ${archiveRemotePath} -C ${REMOTE_INSTALL_DIR}`,
-    `chmod +x ${REMOTE_INSTALL_DIR}/start.sh ${REMOTE_INSTALL_DIR}/bin/craft-server 2>/dev/null || true`,
-    `rm -f ${archiveRemotePath}`,
-    detach(buildLaunch(remotePort)),
+    `tar -xzf ${REMOTE_DOWNLOAD_TMP} -C ${REMOTE_INSTALL_DIR}`,
+    `chmod +x ${REMOTE_INSTALL_DIR}/start.sh ${REMOTE_INSTALL_DIR}/bin/craft-server ${REMOTE_INSTALL_DIR}/vendor/bun/bun 2>/dev/null || true`,
+    `rm -f ${REMOTE_DOWNLOAD_TMP}`,
   ].join(' && ')
 }
 
@@ -203,36 +214,37 @@ export async function bootstrapRemoteServer(
     }
   }
 
-  // 3. Detect the remote OS/arch.
+  // 3. Detect the remote OS/arch, then write the token file (0600, never argv).
   onProgress({ phase: 'detecting-os' })
   const uname = await deps.runRemote(host, 'uname -sm')
   const target = deps.detectTarget(uname)
 
-  // 4. Ensure a local artifact for the target (build on demand in dev).
-  onProgress({ phase: 'building-server', detail: `${target.platform}-${target.arch}` })
-  const artifact = await deps.resolveArtifact(target)
-
-  // 5. Upload + extract.
-  const remoteArchive = `~/.craft-agent/${artifact.archiveName}`
-  onProgress({ phase: 'uploading-server' })
-  await deps.runRemote(host, 'mkdir -p ~/.craft-agent')
-  await deps.uploadFile(host, artifact.archivePath, remoteArchive)
-
-  // 6. Generate + store token, transfer it via stdin (never argv), then
-  //    install + start the server (which reads the token from the 0600 file).
   const token = stored ?? deps.generateToken()
   await deps.storeToken(host.id, token)
-
-  onProgress({ phase: 'installing-server' })
   await deps.runRemote(host, buildWriteTokenCommand(), { stdin: token })
 
-  onProgress({ phase: 'starting-server' })
-  // Extracting a large archive + launching can take a while; allow generous time.
-  await deps.runRemote(host, buildStartCommand(remoteArchive, host.remotePort), {
-    timeoutMs: 180_000,
-  })
+  // 4. Download the prebuilt archive directly onto the remote — no local build,
+  //    no upload. A small VPS only downloads + extracts, never compiles.
+  const url = deps.resolveDownloadUrl(target)
+  onProgress({ phase: 'downloading-server', detail: `${target.platform}-${target.arch}` })
+  try {
+    await deps.runRemote(host, buildDownloadCommand(url), { timeoutMs: 600_000 })
+  } catch (err) {
+    const detail =
+      `Failed to download the server for ${target.platform}-${target.arch}. Check the remote ` +
+      `has internet access and that a release exists for this app version.`
+    onProgress({ phase: 'error', detail })
+    throw new Error(`${detail} (${err instanceof Error ? err.message : String(err)})`)
+  }
 
-  // 7. Re-probe until the server answers.
+  // 5. Extract, then start the server detached.
+  onProgress({ phase: 'installing-server' })
+  await deps.runRemote(host, buildExtractCommand(), { timeoutMs: 180_000 })
+
+  onProgress({ phase: 'starting-server' })
+  await deps.runRemote(host, buildRestartCommand(host.remotePort))
+
+  // 6. Re-probe until the server answers.
   onProgress({ phase: 'waiting-for-server' })
   for (let attempt = 0; attempt < probeAttempts; attempt++) {
     if (await deps.probe()) {

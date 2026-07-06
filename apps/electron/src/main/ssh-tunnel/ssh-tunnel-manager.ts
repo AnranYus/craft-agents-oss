@@ -8,11 +8,10 @@ import { findFreePort } from './port-allocator.ts'
 import {
   SshTunnel,
   buildSshArgs,
-  sshDestination,
   type TunnelState,
   type TunnelConnectOptions,
 } from './ssh-tunnel.ts'
-import { resolveServerArtifact, parseUnameTarget } from './server-artifact.ts'
+import { buildServerDownloadUrl, parseUnameTarget } from './server-artifact.ts'
 import {
   bootstrapRemoteServer,
   type BootstrapProgress,
@@ -20,7 +19,6 @@ import {
 } from './server-bootstrap.ts'
 
 const SSH_BIN = 'ssh'
-const SCP_BIN = 'scp'
 const PROBE_TIMEOUT_MS = 8000
 const PROBE_INTERVAL_MS = 250
 
@@ -185,39 +183,6 @@ export class SshTunnelManager extends EventEmitter {
     })
   }
 
-  /** Upload a local file to the remote host via scp. */
-  private async uploadFile(host: SshHostConfig, localPath: string, remotePath: string): Promise<void> {
-    // -O forces the legacy SCP protocol (safer for minimal sshd without sftp);
-    // pre-OpenSSH-9 scp lacks -O, so retry without it on "unknown option".
-    try {
-      await this.scpUpload(host, localPath, remotePath, true)
-    } catch (err) {
-      if (err instanceof Error && /unknown option/i.test(err.message)) {
-        await this.scpUpload(host, localPath, remotePath, false)
-      } else {
-        throw err
-      }
-    }
-  }
-
-  /** Injectable for tests (bun cannot mock child_process cleanly). */
-  scpExec: typeof execFile = execFile
-
-  private scpUpload(
-    host: SshHostConfig,
-    localPath: string,
-    remotePath: string,
-    legacyFlag: boolean,
-  ): Promise<void> {
-    const args = buildScpArgs(host, localPath, remotePath, legacyFlag)
-    return new Promise((resolve, reject) => {
-      this.scpExec(SCP_BIN, args, { timeout: 120_000 }, (err, _stdout, stderr) => {
-        if (err) reject(new Error(`scp upload failed: ${String(stderr)?.trim() || err.message}`))
-        else resolve()
-      })
-    })
-  }
-
   /** Probe the remote server port directly over ssh (no tunnel needed), used
    * during bootstrap. True if something answers HTTP on 127.0.0.1:<remotePort>. */
   private async probeRemotePort(host: SshHostConfig): Promise<boolean> {
@@ -245,10 +210,8 @@ export class SshTunnelManager extends EventEmitter {
   ): Promise<{ token: string }> {
     const deps: ServerBootstrapDeps = {
       runRemote: (h, cmd, opts) => this.runRemote(h, cmd, opts),
-      uploadFile: (h, local, remote) => this.uploadFile(h, local, remote),
       detectTarget: (uname) => parseUnameTarget(uname),
-      resolveArtifact: (target) =>
-        resolveServerArtifact(target, { isPackaged: isAppPackaged() }),
+      resolveDownloadUrl: (target) => buildServerDownloadUrl(target, getAppVersion()),
       probe: () => this.probeRemotePort(host),
       generateToken: () => generateServerToken(),
       storeToken: (hostId, token) => storeManagedToken(hostId, token),
@@ -279,24 +242,6 @@ export class SshTunnelManager extends EventEmitter {
   }
 }
 
-/** Build the scp argv for an upload. Exported for testing. */
-export function buildScpArgs(
-  host: SshHostConfig,
-  localPath: string,
-  remotePath: string,
-  legacyFlag: boolean,
-): string[] {
-  // scp uses -P for the port (uppercase, unlike ssh's -p).
-  const args = ['-B', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-P', String(host.port)]
-  if (legacyFlag) args.unshift('-O')
-  if (host.identityFile) args.push('-i', host.identityFile, '-o', 'IdentitiesOnly=yes')
-  // scp does not run a shell for the destination path, so strip a leading "~/"
-  // to write relative to the login home dir.
-  const dest = remotePath.replace(/^~\//, '')
-  args.push(localPath, `${sshDestination(host)}:${dest}`)
-  return args
-}
-
 /** Pull a token out of `KEY=value` env lines or a bare token file. */
 function extractToken(out: string): string | undefined {
   const text = out.trim()
@@ -308,15 +253,15 @@ function extractToken(out: string): string | undefined {
   return undefined
 }
 
-/** Whether the Electron app is packaged. Fail-soft to `false` (dev) if electron isn't available. */
-function isAppPackaged(): boolean {
+/** App version — drives the release tag the remote downloads. Fail-soft to
+ * '0.0.0' if electron isn't available (plain-bun unit tests inject their own). */
+function getAppVersion(): string {
   try {
-    // Lazy require so this module stays importable in plain-bun unit tests.
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const electron = require('electron') as { app?: { isPackaged?: boolean } }
-    return electron.app?.isPackaged ?? false
+    const electron = require('electron') as { app?: { getVersion?: () => string } }
+    return electron.app?.getVersion?.() ?? '0.0.0'
   } catch {
-    return false
+    return '0.0.0'
   }
 }
 

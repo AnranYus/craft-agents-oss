@@ -240,7 +240,7 @@ describe('findFreePort', () => {
 
 // Manager helpers: application-level probe + shell quoting
 
-import { probeOnce, buildScpArgs } from '../ssh-tunnel/ssh-tunnel-manager.ts'
+import { probeOnce } from '../ssh-tunnel/ssh-tunnel-manager.ts'
 import { posixSingleQuote } from '../ssh-tunnel/server-bootstrap.ts'
 import type { Socket } from 'net'
 
@@ -284,55 +284,6 @@ describe('probeOnce', () => {
     const p = probeOnce(1234, () => sock as unknown as Socket)
     sock.emit('error', new Error('ECONNREFUSED'))
     expect(await p).toBe(false)
-  })
-})
-
-describe('buildScpArgs', () => {
-  it('includes -O in legacy mode and omits it otherwise', () => {
-    expect(buildScpArgs(HOST, '/l/a.tgz', '~/.craft-agent/a.tgz', true)[0]).toBe('-O')
-    expect(buildScpArgs(HOST, '/l/a.tgz', '~/.craft-agent/a.tgz', false)).not.toContain('-O')
-  })
-
-  it('builds user@host:dest, or host:dest when user is empty', () => {
-    expect(buildScpArgs(HOST, '/l/a.tgz', '~/x', true).at(-1)).toBe('deploy@example.com:x')
-    expect(buildScpArgs({ ...HOST, user: '' }, '/l/a.tgz', '~/x', true).at(-1)).toBe('example.com:x')
-  })
-})
-
-describe('SshTunnelManager.uploadFile — scp -O fallback', () => {
-  type ExecCb = (err: Error | null, stdout: string, stderr: string) => void
-
-  function managerWithScp(behavior: (args: string[]) => { err?: string }) {
-    const manager = new SshTunnelManager()
-    const calls: string[][] = []
-    manager.scpExec = ((_bin: string, args: string[], _opts: unknown, cb: ExecCb) => {
-      calls.push(args)
-      const { err } = behavior(args)
-      queueMicrotask(() => (err ? cb(new Error('scp failed'), '', err) : cb(null, '', '')))
-      return undefined as never
-    }) as unknown as SshTunnelManager['scpExec']
-    const upload = (
-      manager as unknown as { uploadFile(h: SshHostConfig, l: string, r: string): Promise<void> }
-    ).uploadFile.bind(manager)
-    return { manager, calls, upload }
-  }
-
-  it('retries without -O when the local scp does not know the flag (OpenSSH < 9)', async () => {
-    const { manager, calls, upload } = managerWithScp((args) =>
-      args.includes('-O') ? { err: 'scp: unknown option -- O' } : {},
-    )
-    await upload(HOST, '/l/a.tgz', '~/.craft-agent/a.tgz')
-    expect(calls).toHaveLength(2)
-    expect(calls[0]).toContain('-O')
-    expect(calls[1]).not.toContain('-O')
-    manager.disposeAll()
-  })
-
-  it('does not retry (and surfaces stderr) on a real transfer failure', async () => {
-    const { manager, calls, upload } = managerWithScp(() => ({ err: 'Permission denied' }))
-    await expect(upload(HOST, '/l/a.tgz', '~/x')).rejects.toThrow(/Permission denied/)
-    expect(calls).toHaveLength(1)
-    manager.disposeAll()
   })
 })
 
