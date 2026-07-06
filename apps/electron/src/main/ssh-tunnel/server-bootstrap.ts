@@ -29,6 +29,8 @@ export const REMOTE_INSTALL_DIR = '~/.craft-agent/remote-server'
 export const REMOTE_LOG_PATH = '~/.craft-agent/remote-server/server.log'
 /** Token file on the remote (0600). The token travels over ssh stdin, never argv. */
 export const REMOTE_TOKEN_PATH = '~/.craft-agent/remote-server/.token'
+/** Version marker written on install; read on reconnect to detect a stale server. */
+export const REMOTE_VERSION_PATH = '~/.craft-agent/remote-server/.version'
 
 export interface RunRemoteOptions {
   /** Timeout for the remote command, ms. */
@@ -45,6 +47,8 @@ export interface ServerBootstrapDeps {
   detectTarget: (unameOutput: string) => RemoteTarget
   /** Direct download URL of the prebuilt server archive for a target. */
   resolveDownloadUrl: (target: RemoteTarget) => string
+  /** App version to install; a mismatch with the remote marker forces an upgrade. */
+  appVersion: string
   /** Probe the (already forwarded) local port for a live server. */
   probe: () => Promise<boolean>
   /** Generate a fresh server auth token. */
@@ -116,12 +120,19 @@ export function buildDownloadCommand(url: string): string {
   )
 }
 
-/** Remote command that extracts the downloaded archive into the install dir and
- * removes the temp download. */
-export function buildExtractCommand(): string {
+/** Read the installed version marker; empty when absent (legacy/first install). */
+export function buildReadVersionCommand(): string {
+  return `cat ${REMOTE_VERSION_PATH} 2>/dev/null || true`
+}
+
+/** Remove stale code (keeping the token file + server state), extract the archive,
+ * stamp its version, and drop the temp download. */
+export function buildExtractCommand(version: string): string {
   return [
+    `find ${REMOTE_INSTALL_DIR} -mindepth 1 -maxdepth 1 ! -name .token ! -name config -exec rm -rf {} +`,
     `tar -xzf ${REMOTE_DOWNLOAD_TMP} -C ${REMOTE_INSTALL_DIR}`,
     `chmod +x ${REMOTE_INSTALL_DIR}/start.sh ${REMOTE_INSTALL_DIR}/bin/craft-server ${REMOTE_INSTALL_DIR}/vendor/bun/bun 2>/dev/null || true`,
+    `printf '%s' ${posixSingleQuote(version)} > ${REMOTE_VERSION_PATH}`,
     `rm -f ${REMOTE_DOWNLOAD_TMP}`,
   ].join(' && ')
 }
@@ -151,15 +162,22 @@ export async function bootstrapRemoteServer(
   const probeAttempts = deps.probeAttempts ?? DEFAULT_PROBE_ATTEMPTS
   const probeIntervalMs = deps.probeIntervalMs ?? DEFAULT_PROBE_INTERVAL_MS
 
-  // 1. If a server already answers and we have a stored token, we're done.
+  // 1. A live server on our current version is reused; a stale/unmarked one is
+  //    killed and reinstalled below (forceReinstall).
   onProgress({ phase: 'checking-server' })
   const alreadyAlive = await deps.probe()
   const stored = await deps.loadStoredToken(host.id)
+  let forceReinstall = false
   if (alreadyAlive && stored) {
-    onProgress({ phase: 'ready' })
-    return { token: stored }
-  }
-  if (alreadyAlive) {
+    const installedVersion = (await deps.runRemote(host, buildReadVersionCommand())).trim()
+    if (installedVersion === deps.appVersion) {
+      onProgress({ phase: 'ready' })
+      return { token: stored }
+    }
+    onProgress({ phase: 'checking-server', detail: `upgrading ${installedVersion || 'unknown'} -> ${deps.appVersion}` })
+    await deps.runRemote(host, KILL_MANAGED_SERVER_COMMAND)
+    forceReinstall = true
+  } else if (alreadyAlive) {
     // A server answers but we hold no token for it. If OUR install dir is present,
     // it's a managed server whose token we lost — restart with a fresh token.
     const installed = (await deps.runRemote(host, CHECK_INSTALLED_COMMAND)).includes('INSTALLED')
@@ -192,11 +210,14 @@ export async function bootstrapRemoteServer(
     throw new Error(detail)
   }
 
-  // 2. Server not answering but we manage this host and the install is intact
-  //    (process died: crash, reboot, OOM kill) — restart it without re-uploading.
-  if (stored) {
+  // 2. Server not answering but the install is intact (process died: crash,
+  //    reboot, OOM) — restart in place when the installed version still matches.
+  if (!forceReinstall && stored) {
     const installed = (await deps.runRemote(host, CHECK_INSTALLED_COMMAND)).includes('INSTALLED')
-    if (installed) {
+    const installedVersion = installed
+      ? (await deps.runRemote(host, buildReadVersionCommand())).trim()
+      : ''
+    if (installed && installedVersion === deps.appVersion) {
       onProgress({ phase: 'starting-server', detail: 'restart' })
       // Re-write the token file (cheap to refresh) and relaunch; fall through to
       // a full reinstall if the restart doesn't bring the server up.
@@ -239,7 +260,7 @@ export async function bootstrapRemoteServer(
 
   // 5. Extract, then start the server detached.
   onProgress({ phase: 'installing-server' })
-  await deps.runRemote(host, buildExtractCommand(), { timeoutMs: 180_000 })
+  await deps.runRemote(host, buildExtractCommand(deps.appVersion), { timeoutMs: 180_000 })
 
   onProgress({ phase: 'starting-server' })
   await deps.runRemote(host, buildRestartCommand(host.remotePort))

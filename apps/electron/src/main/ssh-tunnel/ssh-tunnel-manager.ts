@@ -212,6 +212,7 @@ export class SshTunnelManager extends EventEmitter {
       runRemote: (h, cmd, opts) => this.runRemote(h, cmd, opts),
       detectTarget: (uname) => parseUnameTarget(uname),
       resolveDownloadUrl: (target) => buildServerDownloadUrl(target, getAppVersion()),
+      appVersion: getAppVersion(),
       probe: () => this.probeRemotePort(host),
       generateToken: () => generateServerToken(),
       storeToken: (hostId, token) => storeManagedToken(hostId, token),

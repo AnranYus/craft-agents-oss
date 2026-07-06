@@ -3,6 +3,7 @@ import {
   bootstrapRemoteServer,
   buildDownloadCommand,
   buildExtractCommand,
+  buildReadVersionCommand,
   buildRestartCommand,
   buildWriteTokenCommand,
   CHECK_INSTALLED_COMMAND,
@@ -10,6 +11,7 @@ import {
   REMOTE_DOWNLOAD_TMP,
   REMOTE_LOG_PATH,
   REMOTE_TOKEN_PATH,
+  REMOTE_VERSION_PATH,
   type ServerBootstrapDeps,
   type BootstrapProgress,
 } from '../ssh-tunnel/server-bootstrap.ts'
@@ -41,23 +43,28 @@ function makeDeps(
   overrides: Partial<ServerBootstrapDeps> & {
     probeResults?: boolean[]
     initialToken?: string
+    installedVersion?: string
   } = {},
 ): { deps: ServerBootstrapDeps; rec: Recorded; onProgress: (p: BootstrapProgress) => void } {
   const rec: Recorded = { remoteCommands: [], remoteStdins: [], stored: {}, progress: [] }
   if (overrides.initialToken) rec.stored[HOST.id] = overrides.initialToken
   const probeResults = overrides.probeResults ? [...overrides.probeResults] : []
   let probeIdx = 0
+  const appVersion = overrides.appVersion ?? '1.0.0'
+  const installedVersion = overrides.installedVersion ?? appVersion
 
   const deps: ServerBootstrapDeps = {
     runRemote: async (_h, cmd, opts) => {
       rec.remoteCommands.push(cmd)
       rec.remoteStdins.push(opts?.stdin)
+      if (cmd === buildReadVersionCommand()) return installedVersion
       if (cmd.includes('uname')) return 'Darwin arm64\n'
       if (cmd.includes('tail')) return 'boom: server crashed\n'
       return ''
     },
     detectTarget: () => ({ platform: 'darwin', arch: 'arm64' }),
     resolveDownloadUrl: () => DOWNLOAD_URL,
+    appVersion,
     probe: async () => {
       const r = probeResults[probeIdx] ?? false
       probeIdx++
@@ -97,11 +104,23 @@ describe('buildDownloadCommand', () => {
 })
 
 describe('buildExtractCommand', () => {
-  it('extracts the download into the install dir and removes the temp file', () => {
-    const cmd = buildExtractCommand()
+  it('cleans stale code (keeping token/config), extracts, stamps version, drops temp', () => {
+    const cmd = buildExtractCommand('2.3.4')
+    expect(cmd).toContain('find')
+    expect(cmd).toContain('! -name .token')
+    expect(cmd).toContain('! -name config')
     expect(cmd).toContain(`tar -xzf ${REMOTE_DOWNLOAD_TMP}`)
     expect(cmd).toContain('chmod +x')
+    expect(cmd).toContain(`printf '%s' '2.3.4' > ${REMOTE_VERSION_PATH}`)
     expect(cmd).toContain(`rm -f ${REMOTE_DOWNLOAD_TMP}`)
+  })
+})
+
+describe('buildReadVersionCommand', () => {
+  it('reads the version marker and tolerates its absence', () => {
+    const cmd = buildReadVersionCommand()
+    expect(cmd).toContain(`cat ${REMOTE_VERSION_PATH}`)
+    expect(cmd).toContain('|| true')
   })
 })
 
@@ -119,11 +138,13 @@ describe('buildRestartCommand', () => {
 })
 
 describe('bootstrapRemoteServer', () => {
-  it('short-circuits when a server is already alive and a token is stored', async () => {
+  it('short-circuits when a live server is already on the current version', async () => {
     const { deps, rec } = makeDeps({ probeResults: [true], initialToken: 'EXISTING_TOKEN' })
     const result = await bootstrapRemoteServer(HOST, deps, (p) => rec.progress.push(p))
     expect(result.token).toBe('EXISTING_TOKEN')
-    expect(rec.remoteCommands).toHaveLength(0)
+    // Only the version marker was read; no install work.
+    expect(rec.remoteCommands).toEqual([buildReadVersionCommand()])
+    expect(ranDownload(rec.remoteCommands)).toBe(false)
     expect(rec.progress.map((p) => p.phase)).toEqual(['checking-server', 'ready'])
   })
 
@@ -260,11 +281,12 @@ describe('bootstrapRemoteServer — alive server, lost token, our install dir', 
 
 describe('bootstrapRemoteServer — restart path (server died, install intact)', () => {
   const installedRunRemote =
-    (rec: string[], stdins: (string | undefined)[]) =>
+    (rec: string[], stdins: (string | undefined)[], installedVersion = '1.0.0') =>
     async (_h: unknown, cmd: string, opts?: { stdin?: string }) => {
       rec.push(cmd)
       stdins.push(opts?.stdin)
       if (cmd === CHECK_INSTALLED_COMMAND) return 'INSTALLED\n'
+      if (cmd === buildReadVersionCommand()) return installedVersion
       if (cmd.includes('uname')) return 'Darwin arm64\n'
       if (cmd.includes('tail')) return 'boom\n'
       return ''
@@ -309,5 +331,56 @@ describe('bootstrapRemoteServer — restart path (server died, install intact)',
     await bootstrapRemoteServer(HOST, deps)
     // Default mock returns '' for the install check → straight to full download+install.
     expect(ranDownload(rec.remoteCommands)).toBe(true)
+  })
+})
+
+describe('bootstrapRemoteServer — version-aware upgrade', () => {
+  it('upgrades a live server whose installed version is stale', async () => {
+    const { deps, rec } = makeDeps({
+      probeResults: [true, true], // alive now; up again after reinstall
+      initialToken: 'EXISTING_TOKEN',
+      appVersion: '2.0.0',
+      installedVersion: '1.0.0',
+    })
+    const result = await bootstrapRemoteServer(HOST, deps, (p) => rec.progress.push(p))
+    expect(result.token).toBe('EXISTING_TOKEN') // token reused across the upgrade
+    // Stale live server killed, then the new version downloaded and stamped.
+    expect(rec.remoteCommands).toContain(KILL_MANAGED_SERVER_COMMAND)
+    expect(ranDownload(rec.remoteCommands)).toBe(true)
+    expect(
+      rec.remoteCommands.some((c) => c.includes(`printf '%s' '2.0.0' > ${REMOTE_VERSION_PATH}`)),
+    ).toBe(true)
+    expect(rec.progress.at(-1)!.phase).toBe('ready')
+  })
+
+  it('upgrades a live server with no version marker (legacy install)', async () => {
+    const { deps, rec } = makeDeps({
+      probeResults: [true, true],
+      initialToken: 'EXISTING_TOKEN',
+      appVersion: '2.0.0',
+      installedVersion: '', // marker absent
+    })
+    await bootstrapRemoteServer(HOST, deps, (p) => rec.progress.push(p))
+    expect(rec.remoteCommands).toContain(KILL_MANAGED_SERVER_COMMAND)
+    expect(ranDownload(rec.remoteCommands)).toBe(true)
+  })
+
+  it('reinstalls instead of restarting a dead install on a stale version', async () => {
+    const cmds: string[] = []
+    const { deps } = makeDeps({
+      initialToken: 'STORED_TOKEN_0123456789abcdef',
+      appVersion: '2.0.0',
+      probeResults: [false, true], // dead, then up after reinstall
+      runRemote: (async (_h: unknown, cmd: string) => {
+        cmds.push(cmd)
+        if (cmd === CHECK_INSTALLED_COMMAND) return 'INSTALLED\n'
+        if (cmd === buildReadVersionCommand()) return '1.0.0' // stale vs appVersion 2.0.0
+        if (cmd.includes('uname')) return 'Darwin arm64\n'
+        return ''
+      }) as ServerBootstrapDeps['runRemote'],
+    })
+    await bootstrapRemoteServer(HOST, deps)
+    // Version mismatch → skip the in-place restart, do a full re-download.
+    expect(ranDownload(cmds)).toBe(true)
   })
 })
