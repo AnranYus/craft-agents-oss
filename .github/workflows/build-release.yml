@@ -1,9 +1,5 @@
 name: Build Release Installers
 
-# A merge into `main` (or manual dispatch) builds the desktop installers
-# (macOS Apple Silicon, Windows x64, Linux x64) AND the prebuilt remote-server
-# tarballs (linux/darwin x64/arm64 — downloaded by one-click SSH), then publishes
-# them to a version-addressable GitHub release (tag v<version>).
 on:
   push:
     branches: [main]
@@ -60,8 +56,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # worker.cjs and the Pi/session server dists are gitignored but referenced by
-      # electron-builder.yml extraResources, so they must exist before packaging.
       - name: Build bundled subprocess artifacts
         shell: bash
         run: |
@@ -71,15 +65,13 @@ jobs:
       - name: Build installer
         run: ${{ matrix.build }}
         env:
-          # OAuth client IDs are baked in at build time when present (else disabled).
           GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
           SLACK_OAUTH_CLIENT_ID: ${{ secrets.SLACK_OAUTH_CLIENT_ID }}
           SLACK_OAUTH_CLIENT_SECRET: ${{ secrets.SLACK_OAUTH_CLIENT_SECRET }}
           MICROSOFT_OAUTH_CLIENT_ID: ${{ secrets.MICROSOFT_OAUTH_CLIENT_ID }}
-          # macOS signing via keychain identity (build-dmg.sh guards these when unset).
-          # CSC_LINK/CSC_KEY_PASSWORD are deliberately omitted: an empty secret is read
-          # by electron-builder as a real cert path and crashes ("<projectDir> not a file").
+          # CSC_LINK/CSC_KEY_PASSWORD are omitted on purpose: an empty secret is
+          # read by electron-builder as a real cert path and crashes the build.
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -92,9 +84,6 @@ jobs:
           path: ${{ matrix.files }}
           if-no-files-found: error
 
-  # Prebuilt remote-server tarballs the one-click SSH flow downloads onto the
-  # target host. build-server.ts copies the native SDK binary from local
-  # node_modules and skips it cross-arch, so each target builds on its own arch.
   build-server:
     name: Server ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -107,8 +96,6 @@ jobs:
             target: linux-x64
           - os: ubuntu-24.04-arm
             target: linux-arm64
-          - os: macos-13
-            target: darwin-x64
           - os: macos-14
             target: darwin-arm64
     steps:
@@ -173,8 +160,8 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          # Version-addressable so one-click SSH can build the download URL from
-          # the app version: .../releases/download/v<version>/craft-server-...tar.gz
+          # Version-addressable so one-click SSH builds the download URL from the
+          # app version: releases/download/v<version>/craft-server-...tar.gz
           tag_name: v${{ steps.ver.outputs.version }}
           name: Craft Agents v${{ steps.ver.outputs.version }}
           prerelease: true
