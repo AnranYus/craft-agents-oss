@@ -32,8 +32,7 @@ interface AddWorkspaceStep_SshProps {
 const PROGRESS_STEPS: SshBootstrapPhase[] = [
   "checking-server",
   "detecting-os",
-  "building-server",
-  "uploading-server",
+  "downloading-server",
   "installing-server",
   "starting-server",
   "waiting-for-server",

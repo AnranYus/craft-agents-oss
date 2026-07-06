@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'bun:test'
 import {
   parseUnameTarget,
-  resolveServerArtifact,
+  buildServerDownloadUrl,
+  serverArchiveName,
+  DEFAULT_SERVER_RELEASE_BASE,
 } from '../ssh-tunnel/server-artifact.ts'
 
 describe('parseUnameTarget', () => {
@@ -23,56 +25,24 @@ describe('parseUnameTarget', () => {
   })
 })
 
-describe('resolveServerArtifact', () => {
-  it('rejects in packaged mode with a clear, escape-hatch-pointing error', async () => {
-    await expect(
-      resolveServerArtifact(
-        { platform: 'linux', arch: 'x64' },
-        { isPackaged: true, fileExists: () => false, runBuild: async () => {} },
-      ),
-    ).rejects.toThrow(/Connect to remote server|packaged/i)
+describe('buildServerDownloadUrl', () => {
+  it('builds a version-addressable release URL for a target', () => {
+    const url = buildServerDownloadUrl({ platform: 'linux', arch: 'x64' }, '0.10.5')
+    expect(url).toBe(`${DEFAULT_SERVER_RELEASE_BASE}/v0.10.5/craft-server-0.10.5-linux-x64.tar.gz`)
   })
 
-  it('reuses a cached artifact without building', async () => {
-    let built = 0
-    const result = await resolveServerArtifact(
-      { platform: 'darwin', arch: 'arm64' },
-      {
-        isPackaged: false,
-        fileExists: () => true, // artifact already present
-        runBuild: async () => {
-          built++
-        },
-      },
+  it('names the archive per target + version', () => {
+    expect(serverArchiveName({ platform: 'darwin', arch: 'arm64' }, '1.2.3')).toBe(
+      'craft-server-1.2.3-darwin-arm64.tar.gz',
     )
-    expect(built).toBe(0)
-    expect(result.archiveName).toMatch(/^craft-server-.*-darwin-arm64\.tar\.gz$/)
   })
 
-  it('builds on demand when the artifact is missing, then finds it', async () => {
-    let built = 0
-    let exists = false
-    const result = await resolveServerArtifact(
+  it('honors a custom base url and trims a trailing slash', () => {
+    const url = buildServerDownloadUrl(
       { platform: 'linux', arch: 'arm64' },
-      {
-        isPackaged: false,
-        fileExists: () => exists,
-        runBuild: async () => {
-          built++
-          exists = true // build produced the artifact
-        },
-      },
+      '2.0.0',
+      'https://cdn.example.com/dl/',
     )
-    expect(built).toBe(1)
-    expect(result.archiveName).toContain('linux-arm64')
-  })
-
-  it('errors if the build claims success but produces no artifact', async () => {
-    await expect(
-      resolveServerArtifact(
-        { platform: 'linux', arch: 'x64' },
-        { isPackaged: false, fileExists: () => false, runBuild: async () => {} },
-      ),
-    ).rejects.toThrow(/artifact was not found/)
+    expect(url).toBe('https://cdn.example.com/dl/v2.0.0/craft-server-2.0.0-linux-arm64.tar.gz')
   })
 })
