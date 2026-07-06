@@ -200,6 +200,12 @@ export function buildClaudeSubprocessEnv(
     delete env.AWS_BEARER_TOKEN_BEDROCK;
     delete env.ANTHROPIC_BEDROCK_BASE_URL;
 
+    // The native claude binary refuses bypassPermissions as root (common on VPS
+    // root logins) unless IS_SANDBOX is set; the agent always runs bypassed.
+    if (typeof process.getuid === 'function' && process.getuid() === 0 && !env.IS_SANDBOX) {
+        env.IS_SANDBOX = '1';
+    }
+
     return env;
 }
 
